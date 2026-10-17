@@ -1,0 +1,204 @@
+name: build
+
+# Builds the `unlocked` branch into a signed Mac Mouse Fix.app. Called by sync-upstream when
+# upstream ships a new version; can also be run by hand.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      release:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp, e.g. 3.1.0 (defaults to UNLOCKED_VERSION on the branch)'
+        type: string
+      release:
+        description: 'Publish a GitHub release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tooling
+          path: ci
+
+      - uses: actions/checkout@v4
+        with:
+          ref: unlocked
+          path: src
+
+      - name: Resolve version
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$INPUT_VERSION"
+          [ -n "$version" ] || version=$(cat src/UNLOCKED_VERSION)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Same scheme as tools/build.sh: 3.1.0 -> 3001000.
+          build_number=$(printf '%s' "$version" | awk -F. '{printf "%d", $1*1000000 + $2*1000 + $3}')
+          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode
+        env:
+          XCODE_APP: ${{ vars.XCODE_APP }}
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          app="${XCODE_APP:-$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)}"
+          echo "using $app"
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+
+      - name: Import signing identity
+        id: sign
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$P12_BASE64" ]; then
+            echo "no signing secret configured - falling back to ad-hoc"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 24)
+          echo "$P12_BASE64" | base64 -d > "$RUNNER_TEMP/identity.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/identity.p12" -k "$keychain" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '" ')
+          rm -f "$RUNNER_TEMP/identity.p12"
+          echo "identity=Mac Mouse Fix Unlocked Builds" >> "$GITHUB_OUTPUT"
+          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          SIGN_IDENTITY: ${{ steps.sign.outputs.identity }}
+          SIGN_KEYCHAIN: ${{ steps.sign.outputs.keychain }}
+        run: bash ci/tools/build.sh src "$VERSION" "$PWD/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MacMouseFix-${{ steps.v.outputs.version }}-unlocked
+          path: dist/*.zip
+
+      - name: Publish release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.v.outputs.version }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO || 'noah-nuebling/mac-mouse-fix' }}
+        run: |
+          set -euo pipefail
+          # Upstream's own notes for this version go first, unmodified: Sparkle's "what's new" opens this
+          # page. A miss only leaves them out; a release must never fail to publish over it.
+          upstream_notes=$(gh release view "$VERSION" --repo "$UPSTREAM" --json body -q .body 2>/dev/null || true)
+          cat > notes.md <<EOF
+          Mac Mouse Fix $VERSION, built from upstream with the trial removed. Source: the [\`unlocked\` branch](https://github.com/$REPO/tree/unlocked) (pristine upstream + \`tools/unlock_pro.py\`).
+
+          EOF
+          if [ -n "$upstream_notes" ]; then
+            {
+              printf "## What's new in %s\n\n*Upstream's release notes, unmodified.*\n\n" "$VERSION"
+              printf '%s\n\n---\n\n' "$upstream_notes"
+            } >> notes.md
+          fi
+          cat >> notes.md <<EOF
+          <details>
+          <summary><b>Install</b></summary>
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/$REPO/main/tools/install.sh | bash
+          \`\`\`
+
+          The script downloads this release, backs up any existing Mac Mouse Fix, installs it, and
+          only resets permissions when the signing identity actually changed. Downloading with curl
+          also avoids the quarantine flag a browser would set, so Gatekeeper never blocks it.
+
+          Manual install: unzip, drag \`Mac Mouse Fix.app\` to \`Applications\`, then
+          \`xattr -dr com.apple.quarantine "/Applications/Mac Mouse Fix.app"\`. Grant Accessibility in
+          System Settings > Privacy & Security.
+
+          </details>
+
+          <details>
+          <summary><b>Signing</b></summary>
+
+          Signed with a self-signed certificate, not notarized. Verify with:
+
+          \`\`\`bash
+          codesign -d -r- "/Applications/Mac Mouse Fix.app"
+          \`\`\`
+
+          The designated requirement is \`identifier "com.nuebling.mac-mouse-fix" and certificate
+          root\`, which is stable across builds, so permission grants survive updates.
+
+          </details>
+
+          <details>
+          <summary><b>Differences from upstream</b></summary>
+
+          Only the licence gating: the app is built with upstream's own \`FORCE_LICENSED\` flag, so it
+          is licensed without a license key and the 30-day trial never runs out. The bundling of the
+          keychain entitlement is dropped so the build needs no provisioning profile. Everything
+          else is upstream, unmodified. Closing this app's "Buy" button would still reach Gumroad.
+
+          </details>
+          EOF
+          tag="v$VERSION-unlocked"
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.zip --repo "$REPO" --clobber
+            gh release edit "$tag" --repo "$REPO" --title "Mac Mouse Fix $VERSION (unlocked)" --notes-file notes.md
+          else
+            gh release create "$tag" dist/*.zip \
+              --repo "$REPO" --title "Mac Mouse Fix $VERSION (unlocked)" --notes-file notes.md
+          fi
+
+      - name: Publish the Sparkle appcast
+        if: inputs.release
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          BUILD_NUMBER: ${{ steps.v.outputs.build_number }}
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SPARKLE_ED_PRIVATE_KEY" ]; then
+            echo "no Sparkle key configured - skipping appcast (in-app updates will find nothing)"
+            exit 0
+          fi
+          zip="dist/MacMouseFixApp-$VERSION-unlocked.zip"
+          url="https://github.com/$REPO/releases/download/v$VERSION-unlocked/MacMouseFixApp-$VERSION-unlocked.zip"
+          python3 ci/tools/make_appcast.py "$zip" "$VERSION" "$BUILD_NUMBER" "$url" appcast.xml
+          # `main` is a mirror the sync job force-pushes, so commit onto whatever it holds now
+          # rather than onto the tooling checkout this job was built from.
+          git clone -q --depth 1 --branch main \
+            "https://x-access-token:$TOKEN@github.com/$REPO.git" mainbranch
+          cp appcast.xml appcast-pre.xml mainbranch/
+          cd mainbranch
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add appcast.xml appcast-pre.xml
+          git diff --cached --quiet && { echo "appcast unchanged"; exit 0; }
+          git commit -qm "appcast: Mac Mouse Fix $VERSION"
+          git push -q origin HEAD:main

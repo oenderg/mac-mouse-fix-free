@@ -1,0 +1,11 @@
+.DS_Store
+dist/
+DerivedData/
+*.p12
+*.pem
+MEMORY.md
+CLAUDE.local.md
+upstream-src/
+auto-fix-notes/
+scratch-scripts/
+.qspacesettings/

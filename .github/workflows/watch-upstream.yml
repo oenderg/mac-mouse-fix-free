@@ -1,0 +1,63 @@
+name: watch-upstream
+
+# Looks for a new upstream release every hour and starts `sync-upstream` when there is one we have
+# not built. The daily `sync-upstream` schedule stays as the backstop and still does the `main` mirror.
+#
+# It also starts nothing for a release whose tag does not carry that version's source (the tag and
+# the project's MARKETING_VERSION must agree); it checks again every hour.
+#
+# It starts nothing while a `ci-failure` issue is open (the daily run retries a broken release, so an
+# hourly retry would only add comments and auto-fix runs) or while a sync is already running.
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  actions: write
+
+concurrency:
+  group: watch-upstream
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start sync-upstream when upstream has a release we have not built
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO || 'noah-nuebling/mac-mouse-fix' }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          ours=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || echo none)
+          echo "upstream=$tag ours=$ours"
+          if [ "$ours" = "v${tag#v}-unlocked" ]; then
+            echo "Up to date."
+            exit 0
+          fi
+          pbx=$(gh api "repos/$UPSTREAM/contents/Mouse%20Fix.xcodeproj/project.pbxproj?ref=$tag" -H "Accept: application/vnd.github.raw")
+          source_version=$(printf '%s\n' "$pbx" | grep -m1 -o 'MARKETING_VERSION = [^;]*' | sed 's/.*= //' || true)
+          if [ "$source_version" != "${tag#v}" ]; then
+            echo "Tag $tag carries source version '${source_version:-unknown}', so the release has no matching source yet; not building."
+            exit 0
+          fi
+          open=$(gh issue list --repo "$REPO" --label ci-failure --state open --json number -q length)
+          if [ "$open" != "0" ]; then
+            echo "A ci-failure issue is open; leaving the retry to the daily run."
+            exit 0
+          fi
+          for status in queued in_progress; do
+            n=$(gh run list --repo "$REPO" --workflow sync.yml --status "$status" --json databaseId -q length)
+            if [ "$n" != "0" ]; then
+              echo "sync-upstream is already $status; not starting another."
+              exit 0
+            fi
+          done
+          echo "New upstream release $tag: starting sync-upstream."
+          gh workflow run sync.yml --repo "$REPO" --ref main
