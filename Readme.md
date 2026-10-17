@@ -16,8 +16,6 @@ It downloads the [latest release](https://github.com/oenderg/mac-mouse-fix-free/
 
 Then grant **Accessibility** in System Settings → Privacy & Security, which the app needs to remap your mouse. The installer opens the right pane for you. Your existing settings carry over (same bundle ID).
 
-> **While the repository is private, the two `raw.githubusercontent.com` URLs above need a login** (Sparkle's feed fetch and the installer are unauthenticated). Making the repository public fixes that; it is the one thing that still has to change.
-
 <details>
 <summary><b>Manual install</b>, if you'd rather not pipe a script into bash</summary>
 
