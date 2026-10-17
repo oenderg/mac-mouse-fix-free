@@ -1,0 +1,16 @@
+blank_issues_enabled: true # [Mar 2025] had to set this to true to not break MMF Feedback Assistant. See https://github.com/orgs/community/discussions/14287#discussioncomment-12691930
+
+contact_links:
+  - name: Need help?
+    url: https://redirect.macmousefix.com/?target=mmf-guides-and-community
+    about: View guides or ask the community
+  - name: Bug report
+    url: https://redirect.macmousefix.com/?target=mmf-feedback-bug-report
+    about: Report a bug
+  - name: Enhancement request
+    url: https://redirect.macmousefix.com/?target=mmf-feedback-feature-request
+    about: Suggest a new feature, UI changes, or other improvements
+  # [Mar 2025] vvv Disabling since we're forced to set `blank_issues_enabled: true`
+  # - name: Free form feedback
+  #  url: https://redirect.macmousefix.com/?target=mmf-feedback-other
+  #  about: Write free form feedback
