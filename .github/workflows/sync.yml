@@ -97,7 +97,9 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           pbx=$(gh api "repos/$UPSTREAM/contents/Mouse%20Fix.xcodeproj/project.pbxproj?ref=$tag" -H "Accept: application/vnd.github.raw")
-          source_version=$(printf '%s\n' "$pbx" | grep -m1 -o 'MARKETING_VERSION = [^;]*' | sed 's/.*= //' || true)
+          # Several targets set MARKETING_VERSION (a dummy app uses 1.0); the app's own is the
+          # highest, so take that rather than the first match.
+          source_version=$(printf '%s\n' "$pbx" | grep -o 'MARKETING_VERSION = [^;]*' | sed 's/.*= //; s/ *$//' | grep -v '^$' | sort -V | tail -1)
           if [ "$source_version" != "$version" ]; then
             echo "::notice::Upstream tag $tag carries source version '${source_version:-unknown}', not $version: the release has no matching source, so nothing is built. Checked again on the next run."
             echo "changed=false" >> "$GITHUB_OUTPUT"

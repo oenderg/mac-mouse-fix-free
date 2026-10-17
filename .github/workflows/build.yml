@@ -57,8 +57,9 @@ jobs:
           XCODE_APP: ${{ vars.XCODE_APP }}
         run: |
           set -euo pipefail
-          ls -d /Applications/Xcode*.app
-          app="${XCODE_APP:-$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)}"
+          ls -d /Applications/Xcode*.app || true
+          app="${XCODE_APP:-$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)}"
+          [ -n "$app" ] || app=/Applications/Xcode.app
           echo "using $app"
           sudo xcode-select -s "$app/Contents/Developer"
           xcodebuild -version

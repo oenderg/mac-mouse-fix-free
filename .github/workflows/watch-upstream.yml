@@ -42,7 +42,9 @@ jobs:
             exit 0
           fi
           pbx=$(gh api "repos/$UPSTREAM/contents/Mouse%20Fix.xcodeproj/project.pbxproj?ref=$tag" -H "Accept: application/vnd.github.raw")
-          source_version=$(printf '%s\n' "$pbx" | grep -m1 -o 'MARKETING_VERSION = [^;]*' | sed 's/.*= //' || true)
+          # Several targets set MARKETING_VERSION (a dummy app uses 1.0); the app's own is the
+          # highest, so take that rather than the first match.
+          source_version=$(printf '%s\n' "$pbx" | grep -o 'MARKETING_VERSION = [^;]*' | sed 's/.*= //; s/ *$//' | grep -v '^$' | sort -V | tail -1)
           if [ "$source_version" != "${tag#v}" ]; then
             echo "Tag $tag carries source version '${source_version:-unknown}', so the release has no matching source yet; not building."
             exit 0
