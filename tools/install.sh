@@ -78,6 +78,12 @@ fi
 say "Launching Mac Mouse Fix $version"
 open "$APP"
 
+# Nudge the app to (re-)register its login item a moment after launch. Coming from a copy signed
+# with a different identity (the official app, or your own build) can leave a stale registration
+# that makes macOS refuse to start the helper; re-registering clears it.
+sleep 3
+open "macmousefix:restarthelper?delay=1" >/dev/null 2>&1 || true
+
 if [ "$needs_grant" = "1" ]; then
   cat <<'EOF'
 
