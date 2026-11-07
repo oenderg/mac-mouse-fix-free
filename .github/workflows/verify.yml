@@ -1,0 +1,90 @@
+name: verify
+
+# Proves a change to the tooling still produces a working unlocked Mac Mouse Fix, against the
+# newest upstream release: the unlock applies, tools/verify_unlock.py approves the resulting diff,
+# and the patched source builds into a universal, validly signed app. No secrets are used or needed.
+# Required status checks: `verify-unlock`, `verify-build`.
+
+on:
+  pull_request:
+    branches: [tooling]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-unlock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Apply the unlock to the newest upstream release and verify the diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO || 'noah-nuebling/mac-mouse-fix' }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          echo "checking against upstream $UPSTREAM $tag"
+          git clone -q --depth 1 --branch "$tag" "https://github.com/$UPSTREAM.git" src
+          python3 ci/tools/unlock_pro.py src
+          python3 ci/tools/verify_unlock.py src
+
+  verify-build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          app="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$app" ] || app=/Applications/Xcode.app
+          echo "using $app"
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+
+      - name: Apply the unlock to the newest upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO || 'noah-nuebling/mac-mouse-fix' }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          git clone -q --depth 1 --branch "$tag" "https://github.com/$UPSTREAM.git" src
+          python3 ci/tools/unlock_pro.py src
+          python3 ci/tools/verify_unlock.py src
+
+      - name: Build, ad-hoc signed
+        run: bash ci/tools/build.sh src "${TAG}" "$PWD/dist"
+
+      - name: Check the built app
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ditto -x -k dist/*.zip out
+          app="out/Mac Mouse Fix.app"
+          [ -d "$app" ] || { echo "::error::the zip has no Mac Mouse Fix.app"; exit 1; }
+          [ -d "$app/Contents/Library/LoginItems/Mac Mouse Fix Helper.app" ] || { echo "::error::the helper is not embedded"; exit 1; }
+          codesign --verify --deep --strict "$app"
+          archs=$(lipo -archs "$app/Contents/MacOS/Mac Mouse Fix")
+          echo "architectures: $archs"
+          [[ "$archs" == *arm64* && "$archs" == *x86_64* ]] || { echo "::error::not a universal binary"; exit 1; }
+          feed=$(plutil -extract SUFeedURL raw "$app/Contents/Info.plist")
+          echo "feed: $feed"
+          [[ "$feed" == https://raw.githubusercontent.com/oenderg/mac-mouse-fix-free/* ]] || { echo "::error::wrong update feed"; exit 1; }
+          # The app must be licensed without a key: tools/unlock_pro.py replaces the About tab's
+          # "FORCE_LICENSED" wording, which is the only place that string appears.
+          strings "$app/Contents/MacOS/Mac Mouse Fix" | grep -q "FORCE_LICENSED" \
+            && { echo "::error::the About tab still shows the raw flag"; exit 1; } || true
+          strings "$app/Contents/MacOS/Mac Mouse Fix" | grep -q "unlocked build" \
+            || { echo "::error::the unlocked build wording is missing"; exit 1; }
