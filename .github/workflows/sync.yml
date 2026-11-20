@@ -1,0 +1,209 @@
+name: sync-upstream
+
+# Three things, in order:
+#  1. mirror  - rebuild `main` as upstream master + our tooling, so GitHub's fork comparison
+#               reads "1 commit ahead, 0 behind" instead of counting all of upstream's history
+#  2. sync    - if upstream published a new release, regenerate `unlocked` (pristine tag + patch)
+#  3. build   - only then reach for the 10x-billed macOS runner
+#
+# `tooling` is the durable source of truth for step 1: `main` is force-pushed and must never be
+# edited directly. Nothing is ever merged, so none of this can conflict.
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even when upstream has no new version'
+        type: boolean
+        default: false
+      simulate_failure:
+        description: 'Fail on purpose, to test the failure issue and the auto-fix workflow'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tooling
+          path: ci
+
+      - name: Rebuild `main` from upstream master plus our tooling
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git clone -q https://github.com/noah-nuebling/mac-mouse-fix.git up
+          cd up
+          git checkout -q master
+          rm -rf .github/workflows
+          mkdir -p .github/workflows tools
+          cp -R ../ci/.github/workflows/. .github/workflows/
+          cp -R ../ci/tools/. tools/
+          # The front page is our README followed by upstream's current one, so it never goes stale.
+          cp Readme.md ../upstream-Readme.md
+          cat ../ci/Readme.md ../upstream-Readme.md > Readme.md
+          # Keep the submodule gitlink intact, otherwise `git add -A` would drop it.
+          git submodule update --init --depth 1 || true
+          # Carry forward the appcast the build job publishes, so mirroring never unpublishes it.
+          curl -fsSL "https://raw.githubusercontent.com/$REPO/main/appcast.xml" -o appcast.xml || true
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -qF - <<'EOF'
+          Trial removed: build tooling, daily upstream sync, signed releases
+
+          Upstream master plus the tooling on this repo's `tooling` branch. The unlock patch is
+          applied at build time and lives on the `unlocked` branch, so the diff between this
+          branch and upstream is exactly the tooling.
+          EOF
+          git push -qf "https://x-access-token:$TOKEN@github.com/$REPO.git" HEAD:main
+
+  sync:
+    needs: mirror
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tooling
+          path: ci
+
+      - name: Compare upstream release against ours
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO || 'noah-nuebling/mac-mouse-fix' }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          version=${tag#v}
+          ours=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || echo none)
+          echo "upstream=$tag ours=$ours"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          pbx=$(gh api "repos/$UPSTREAM/contents/Mouse%20Fix.xcodeproj/project.pbxproj?ref=$tag" -H "Accept: application/vnd.github.raw")
+          # Several targets set MARKETING_VERSION (a dummy app uses 1.0); the app's own is the
+          # highest, so take that rather than the first match.
+          source_version=$(printf '%s\n' "$pbx" | grep -o 'MARKETING_VERSION = [^;]*' | sed 's/.*= //; s/ *$//' | grep -v '^$' | sort -V | tail -1)
+          if [ "$source_version" != "$version" ]; then
+            echo "::notice::Upstream tag $tag carries source version '${source_version:-unknown}', not $version: the release has no matching source, so nothing is built. Checked again on the next run."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          elif [ "$ours" = "v$version-unlocked" ] && [ "$FORCE" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail on purpose (test switch)
+        if: inputs.simulate_failure
+        run: |
+          echo "::error::simulated failure, requested by the simulate_failure input"
+          exit 1
+
+      - name: Apply the unlock patch to a pristine upstream checkout
+        if: steps.check.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO || 'noah-nuebling/mac-mouse-fix' }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$TAG" "https://github.com/$UPSTREAM.git" src
+          python3 ci/tools/unlock_pro.py src
+          echo "${{ steps.check.outputs.version }}" > src/UNLOCKED_VERSION
+
+      - name: Publish the patched source to the `unlocked` branch
+        if: steps.check.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd src
+          rm -rf .git .github/workflows
+          git init -q -b unlocked
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -qm "Mac Mouse Fix $VERSION with the trial removed
+
+          Generated from noah-nuebling/mac-mouse-fix v$VERSION by tools/unlock_pro.py on the
+          tooling branch. Regenerated from pristine upstream on every run and force-pushed, so it
+          never diverges and never conflicts."
+          git push -f "https://x-access-token:$TOKEN@github.com/$REPO.git" unlocked
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.sync.outputs.version }}
+      release: true
+    secrets: inherit
+
+  # Tell a person when the pipeline breaks, once per breakage rather than once per day: an open
+  # `ci-failure` issue gets a comment, otherwise one is opened. The next fully green run closes it.
+  notify-failure:
+    needs: [mirror, sync, build]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/$REPO/actions/runs/$RUN_ID"
+          failed=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.conclusion == "failure")
+            | "- **\(.name)**, step \"\([.steps[] | select(.conclusion == "failure") | .name] | first // "unknown")\""')
+          body=$(printf 'sync-upstream failed for upstream Mac Mouse Fix %s.\n\n%s\n\nRun: %s\n\nThe most likely cause is that upstream changed a file the unlock patch anchors on (`tools/unlock_pro.py` then stops with "anchor drifted"). Nothing was published, so the last good release stays in place.' "${VERSION:-(unknown)}" "$failed" "$url")
+          gh label create ci-failure --repo "$REPO" --color B60205 --description "sync-upstream is broken" 2>/dev/null || true
+          existing=$(gh issue list --repo "$REPO" --label ci-failure --state open --json number -q '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Failed again. $body"
+          else
+            gh issue create --repo "$REPO" --label ci-failure \
+              --title "sync-upstream failed (upstream ${VERSION:-unknown})" --body "$body"
+          fi
+
+  close-failure:
+    needs: [mirror, sync, build]
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --repo "$REPO" --label ci-failure --state open --json number -q '.[].number' 2>/dev/null); do
+            gh issue close "$n" --repo "$REPO" --comment "Fixed: sync-upstream passed again ($RUN_URL)."
+          done

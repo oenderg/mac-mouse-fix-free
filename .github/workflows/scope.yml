@@ -1,0 +1,63 @@
+name: scope
+
+# Limits what an automated fix may change. Applies to pull requests from `claude/*` branches (the
+# branches Claude's GitHub action creates); anything else passes, so human pull requests are never
+# blocked here.
+#
+# Runs on `pull_request_target`, which means GitHub uses THIS file as it exists on the base branch,
+# not the copy in the pull request. A fix therefore cannot edit this check to get past it. Nothing
+# from the pull request is checked out or executed: the check only reads the list of changed files.
+# Required status check: `check-scope`.
+
+on:
+  pull_request_target:
+    branches: [tooling]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-scope:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the changed files and the size of the change
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          # Only these may change. Everything else needs a person: workflows, installer, signing,
+          # appcast, this check, the verifier, CLAUDE.md, README.
+          ALLOWED: |
+            tools/unlock_pro.py
+          MAX_LINES: '150'
+        run: |
+          set -euo pipefail
+          case "$HEAD_REF" in
+            claude/*) ;;
+            *) echo "not an automated fix ($HEAD_REF): nothing to restrict"; exit 0 ;;
+          esac
+
+          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | "\(.filename)\t\(.additions + .deletions)\t\(.status)"')
+          bad=0 total=0
+          while IFS=$'\t' read -r name lines status; do
+            [ -n "$name" ] || continue
+            total=$((total + lines))
+            ok=0
+            while IFS= read -r allowed; do
+              [ -n "$allowed" ] || continue
+              case "$allowed" in
+                */) [[ "$name" == "$allowed"* ]] && ok=1 ;;
+                *)  [ "$name" = "$allowed" ] && ok=1 ;;
+              esac
+            done <<< "$ALLOWED"
+            if [ "$ok" = 0 ]; then echo "::error::not allowed to change: $name"; bad=1; fi
+            [ "$status" = "renamed" ] && { echo "::error::renames are not allowed: $name"; bad=1; }
+          done <<< "$files"
+
+          echo "changed lines: $total (limit $MAX_LINES)"
+          if [ "$total" -gt "$MAX_LINES" ]; then echo "::error::change is larger than $MAX_LINES lines"; bad=1; fi
+          [ "$bad" = 0 ] || { echo "An automated fix may only touch the unlock script and its stubs, and only a little."; exit 1; }
+          echo "scope ok"
